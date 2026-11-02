@@ -1,0 +1,467 @@
+@import "tailwindcss";
+/* 한글 UI 글꼴. 내려받지 않고 node_modules 에서 쪼개 담은 woff2 를 쓴다(필요한 글자 조각만 불러와요). */
+@import "pretendard/dist/web/variable/pretendardvariable-dynamic-subset.css";
+
+/*
+ * 디자인 토큰 — "편집실": 진짜 검정 무대 위에서 영상이 주인공이고, 면은 밝기 단계로만 구분한다.
+ * 호박색(amber)은 "지금 여기"(재생헤드·진행·고른 것·내 차례)에만, 흰색은 "확정하는 행동"에만 쓴다.
+ * 값의 근거와 사용처는 docs/superpowers/plans/2026-10-20-02-design-notes.md
+ */
+:root {
+  color-scheme: dark;
+
+  --ground: #09090a;
+  --surface: #111113;
+  --raised: #19191c;
+  --lift: #222226;
+  --line: #1f1f23;
+  --line-strong: #2d2d33;
+  --field-line: #62626b;
+  --ink: #f5f5f6;
+  --ink-2: #a8a8b0;
+  --ink-3: #8b8b94;
+
+  --accent: #ffb224;
+  --accent-ink: #ffc65c;
+  --accent-deep: #1b1200;
+  --accent-soft: #2a2008;
+  --ring: #ffc65c;
+
+  --stage: #000000;
+  --ok: #52e0a4;
+  --ok-soft: #0f2a1f;
+  --warn: #f5c451;
+  --warn-soft: #2b2208;
+  --bad: #ff7b82;
+  --bad-soft: #2e1519;
+  --info: #a9bbd6;
+  --info-soft: #161c27;
+
+  --shadow-float: 0 24px 64px rgb(0 0 0 / 0.6), 0 2px 8px rgb(0 0 0 / 0.5);
+
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.76, 0, 0.24, 1);
+
+  --font-stack: "Pretendard Variable", Pretendard, system-ui, -apple-system, "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", sans-serif;
+}
+
+@theme inline {
+  --color-canvas: var(--ground);
+  --color-panel: var(--surface);
+  --color-raised: var(--raised);
+  --color-sunken: var(--raised);
+  --color-lift: var(--lift);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-field-line: var(--field-line);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-deep: var(--accent-deep);
+  --color-accent-soft: var(--accent-soft);
+  --color-ring: var(--ring);
+  --color-stage: var(--stage);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-bad: var(--bad);
+  --color-bad-soft: var(--bad-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+
+  --font-sans: var(--font-stack);
+  --radius-control: 12px;
+  --radius-panel: 20px;
+  --radius-chip: 8px;
+  --shadow-float: var(--shadow-float);
+}
+
+@layer base {
+  html {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-stack);
+    font-size: 15px;
+    line-height: 1.6;
+    letter-spacing: -0.005em;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    word-break: keep-all;
+    overflow-wrap: break-word;
+    scrollbar-color: var(--line-strong) transparent;
+    scrollbar-width: thin;
+  }
+
+  body {
+    min-height: 100dvh;
+    background: var(--ground);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: var(--accent);
+    color: var(--accent-deep);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  video,
+  img {
+    max-width: 100%;
+  }
+
+  button,
+  [role="button"],
+  a {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* 숫자는 자리를 맞춘다(타임코드·시간·크기가 흔들리지 않게) */
+  .tnum,
+  time,
+  [role="progressbar"] {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* ───────── 타임라인 눈금자(components/ui/Steps.tsx): 단계는 장(chapter), 재생헤드는 지금 위치 ───────── */
+@layer components {
+  .tp {
+    --tp-h: 6px;
+  }
+
+  .tp-seg {
+    position: relative;
+    height: var(--tp-h);
+    background: var(--lift);
+    overflow: visible;
+  }
+
+  .tp-seg[data-state="done"] {
+    background: var(--accent);
+  }
+
+  .tp-seg[data-state="failed"] {
+    background: var(--bad);
+    opacity: 0.55;
+  }
+
+  /* 눈금: 구간 시작의 긴 눈금 + 구간 안의 짧은 눈금 */
+  .tp-ticks {
+    height: 9px;
+    background-image: linear-gradient(var(--line-strong), var(--line-strong)), repeating-linear-gradient(90deg, var(--line-strong) 0 1px, transparent 1px 25%);
+    background-size:
+      1px 9px,
+      100% 4px;
+    background-repeat: no-repeat;
+    background-position:
+      left top,
+      left top;
+  }
+
+  .playhead {
+    position: absolute;
+    top: -7px;
+    bottom: -7px;
+    width: 2px;
+    margin-left: -1px;
+    background: var(--accent);
+    border-radius: 1px;
+    pointer-events: none;
+    box-shadow: 0 0 14px 1px rgb(255 178 36 / 0.55);
+  }
+
+  .playhead::before {
+    content: "";
+    position: absolute;
+    top: -4px;
+    left: 50%;
+    width: 11px;
+    height: 8px;
+    transform: translateX(-50%);
+    background: var(--accent);
+    clip-path: polygon(0 0, 100% 0, 50% 100%);
+  }
+
+  .playhead[data-tone="bad"] {
+    background: var(--bad);
+    box-shadow: 0 0 14px 1px rgb(255 123 130 / 0.5);
+  }
+
+  .playhead[data-tone="bad"]::before {
+    background: var(--bad);
+  }
+
+  .playhead[data-motion="run"] {
+    left: 0;
+    animation: playhead-run 2.6s linear infinite;
+  }
+
+  .playhead[data-motion="rest"] {
+    left: 0;
+  }
+
+  /* 뷰파인더: 모서리 괄호 */
+  .vf {
+    position: relative;
+  }
+
+  .vf-c {
+    position: absolute;
+    width: 22px;
+    height: 22px;
+    border: 0 solid var(--ink);
+    opacity: 0.85;
+    pointer-events: none;
+    transition:
+      transform 500ms var(--ease-expo),
+      opacity 300ms var(--ease-out),
+      border-color 300ms var(--ease-out);
+  }
+
+  .vf-c[data-p="tl"] {
+    top: 14px;
+    left: 14px;
+    border-top-width: 2px;
+    border-left-width: 2px;
+    border-top-left-radius: 6px;
+  }
+
+  .vf-c[data-p="tr"] {
+    top: 14px;
+    right: 14px;
+    border-top-width: 2px;
+    border-right-width: 2px;
+    border-top-right-radius: 6px;
+  }
+
+  .vf-c[data-p="bl"] {
+    bottom: 14px;
+    left: 14px;
+    border-bottom-width: 2px;
+    border-left-width: 2px;
+    border-bottom-left-radius: 6px;
+  }
+
+  .vf-c[data-p="br"] {
+    bottom: 14px;
+    right: 14px;
+    border-bottom-width: 2px;
+    border-right-width: 2px;
+    border-bottom-right-radius: 6px;
+  }
+
+  .vf[data-active="true"] .vf-c {
+    border-color: var(--accent);
+    opacity: 1;
+  }
+
+  .vf[data-active="true"] .vf-c[data-p="tl"] {
+    transform: translate(6px, 6px);
+  }
+  .vf[data-active="true"] .vf-c[data-p="tr"] {
+    transform: translate(-6px, 6px);
+  }
+  .vf[data-active="true"] .vf-c[data-p="bl"] {
+    transform: translate(6px, -6px);
+  }
+  .vf[data-active="true"] .vf-c[data-p="br"] {
+    transform: translate(-6px, -6px);
+  }
+}
+
+/* ───────── 등장: 한 번에 하나씩 차례로(화면마다 지휘된 한 장면). 움직이지 않는 설정이면 바로 완성 상태 ───────── */
+.enter {
+  animation: enter 700ms var(--ease-expo) both;
+  animation-delay: calc(var(--i, 0) * 70ms);
+}
+
+.wipe {
+  animation: wipe 900ms var(--ease-expo) both;
+  animation-delay: calc(var(--i, 0) * 70ms);
+}
+
+@keyframes enter {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+}
+
+@keyframes wipe {
+  from {
+    clip-path: inset(0 100% 0 0);
+    transform: translateX(-12px);
+    opacity: 0;
+  }
+  to {
+    clip-path: inset(0 0 0 0);
+  }
+}
+
+@keyframes playhead-run {
+  from {
+    left: 0;
+  }
+  to {
+    left: 100%;
+  }
+}
+
+@keyframes skeleton-pulse {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+@keyframes dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.985);
+  }
+}
+
+/* ───────── 진행 무대의 모션 그래픽(components/job/StageGraphic.tsx) ───────── */
+@keyframes sg-wave {
+  from {
+    transform: scaleY(var(--lo, 0.12));
+  }
+  to {
+    transform: scaleY(var(--hi, 1));
+  }
+}
+
+@keyframes sg-scan {
+  from {
+    transform: translateY(-6%);
+  }
+  to {
+    transform: translateY(106%);
+  }
+}
+
+@keyframes sg-strip {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+@keyframes sg-cell {
+  0%,
+  100% {
+    opacity: 0.18;
+  }
+  35% {
+    opacity: 1;
+  }
+}
+
+@keyframes sg-cut {
+  0% {
+    transform: scaleX(0);
+  }
+  55%,
+  100% {
+    transform: scaleX(1);
+  }
+}
+
+@keyframes sg-tick {
+  0%,
+  12% {
+    opacity: 0;
+    transform: scale(0.6);
+  }
+  22%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes sg-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes sg-blink {
+  50% {
+    opacity: 0.2;
+  }
+}
+
+@keyframes dz-float {
+  from {
+    transform: translateY(4px);
+  }
+  to {
+    transform: translateY(-6px);
+  }
+}
+
+@keyframes vf-breathe {
+  50% {
+    transform: scale(1.012);
+  }
+}
+
+/* 확정: 클래퍼보드가 "딱" */
+@keyframes clap-stick {
+  0% {
+    transform: rotate(-24deg);
+  }
+  38% {
+    transform: rotate(-24deg);
+  }
+  52% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(0deg);
+  }
+}
+
+@keyframes clap-flash {
+  0%,
+  48% {
+    opacity: 0;
+  }
+  54% {
+    opacity: 0.9;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+dialog[open] {
+  animation: dialog-in 260ms var(--ease-out);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    animation-delay: 0ms !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .playhead[data-motion="run"] {
+    left: 50%;
+  }
+}

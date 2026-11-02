@@ -1,0 +1,752 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { beforeEach, describe, expect, test } from 'vitest'
+import { ToolError } from '../src/core/exec.ts'
+import { ReferenceFetchError } from '../src/core/reference.ts'
+import { TempoError } from '../src/core/tempo.ts'
+import { VoiceError } from '../src/core/voice.ts'
+import { SoundError } from '../src/shared/sound.ts'
+import { VOICE_TOOL_MISSING } from '../src/shared/voice.ts'
+import type { Analysis, Prepared } from '../src/core/pipeline.ts'
+import { openDb } from '../src/db/db.ts'
+import { Jobs } from '../src/db/jobs.ts'
+import type { JobStatus, Recommendation } from '../src/shared/types.ts'
+import { runOnce, startWorker, type WorkerDeps } from '../src/worker/worker.ts'
+
+let dir: string
+let jobs: Jobs
+
+beforeEach(() => {
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vae-worker-'))
+  jobs = new Jobs(openDb(dir), dir)
+})
+
+const INFO = { path: '/x/source.mp4', durationSec: 56.8, width: 1080, height: 1920, fps: 30, hasAudio: true, videoBitrate: 2e6 }
+const ANALYSIS: Analysis = {
+  version: 1,
+  sourcePath: '/x/source.mp4',
+  info: INFO,
+  transcript: { language: 'ko', durationSec: 56.8, words: [], segments: [], hasSpeech: true },
+  summary: { topic: '롱아이언', genre: '골프 레슨', oneLine: '롱아이언 팁', language: 'ko', hasPeople: true, hookTitle: '롱아이언 꿀팁', searchQueries: ['q1', 'q2', 'q3'], source: 'analyzed' },
+  purposeGuess: { purpose: 'short', confidence: 0.8, reasons: ['세로 비율'] },
+}
+const SPEC = { orientation: 'portrait' } as never
+const PREPARED: Prepared = {
+  purpose: 'short',
+  purposeChoice: 'auto',
+  purposeGuess: ANALYSIS.purposeGuess,
+  plan: { mode: 'full-reference', take: ['pacing'], skip: [], adjust: [], unsupported: [] },
+  planCard: ['이렇게 이해했어요: …'],
+  reframe: 'none',
+  referenceSource: 'https://youtu.be/abc',
+  captionPosition: 'top',
+  script: { version: 1, title: '계획 제목', hook: { sourceStart: 10, sourceEnd: 13, question: '계획 질문?' }, openingLines: ['소개'], sections: [], questions: [], reactions: [], emphasis: [], speed: 1.1, drop: [] },
+  spec: SPEC,
+}
+const REC: Recommendation = { id: 'abc', url: 'https://www.youtube.com/watch?v=abc', title: '추천 영상', viewCount: 1000, durationSec: 59, thumbnail: 'https://i.ytimg.com/vi/abc/hqdefault.jpg' }
+
+interface Calls {
+  analyze: Parameters<WorkerDeps['analyzeInput']>[0][]
+  prepare: Parameters<WorkerDeps['prepareEdit']>[0][]
+  produce: Parameters<WorkerDeps['produceEdit']>[0][]
+  search: Parameters<WorkerDeps['searchReferences']>[0][]
+  remix: Parameters<WorkerDeps['remixSound']>[0][]
+}
+
+function fakes(over: Partial<WorkerDeps> = {}) {
+  const calls: Calls = { analyze: [], prepare: [], produce: [], search: [], remix: [] }
+  const deps: WorkerDeps = {
+    probeVideo: async () => INFO,
+    detectPurpose: (i) => ({ purpose: i.info.height > i.info.width ? 'short' : 'post', confidence: 0.8, reasons: ['테스트'] }),
+    analyzeInput: async (i) => {
+      calls.analyze.push(i)
+      i.onStage?.('transcribe')
+      return ANALYSIS
+    },
+    prepareEdit: async (i) => {
+      calls.prepare.push(i)
+      i.onStage?.('plan')
+      return PREPARED
+    },
+    produceEdit: async (i) => {
+      calls.produce.push(i)
+      fs.mkdirSync(i.outDir, { recursive: true })
+      fs.writeFileSync(path.join(i.outDir, 'result.mp4'), 'mp4')
+      fs.writeFileSync(path.join(i.outDir, 'report.json'), JSON.stringify({ qa: { passed: true, findings: [] }, unchecked: ['싱크'] }))
+      i.onStage?.('render', 'looks 화질')
+      return { resultPath: path.join(i.outDir, 'result.mp4'), purpose: 'short', attempts: 2, delivered: true } as never
+    },
+    remixSound: async (i) => {
+      calls.remix.push(i)
+      return { sfxCount: 0, balance: { ...i.gains, aiBgmGainDb: 0, aiSfxGainDb: 0, reason: '' } }
+    },
+    searchReferences: async (i) => {
+      calls.search.push(i)
+      return [REC]
+    },
+    makeThumbnail: async (_video, out) => {
+      fs.writeFileSync(out, 'jpg')
+    },
+    ...over,
+  }
+  return { deps, calls }
+}
+
+/** 작업을 만들어 원하는 상태·필드로 만든다 */
+function job(status: JobStatus, patch: Parameters<Jobs['update']>[1] = {}) {
+  const j = jobs.create()
+  const src = path.join(jobs.jobDir(j.id), 'source.mp4')
+  fs.writeFileSync(src, 'video')
+  return jobs.update(j.id, { status, sourcePath: src, sourceName: '내 영상.mp4', ...patch })
+}
+
+const writeAnalysis = (id: string) => fs.writeFileSync(path.join(jobs.jobDir(id), 'analysis.json'), JSON.stringify(ANALYSIS))
+
+describe('probe 단계', () => {
+  test('영상 정보·자동 인식 용도·썸네일을 채우고 ready 로 보낸다', async () => {
+    const j = job('queued_probe')
+    const f = fakes()
+    expect(await runOnce(jobs, f.deps)).toBe('processed')
+    const after = jobs.get(j.id)!
+    expect(after.status).toBe('ready')
+    expect(after.sourceInfo).toEqual({ durationSec: 56.8, width: 1080, height: 1920 })
+    expect(after.purposeGuess).toMatchObject({ purpose: 'short' })
+    expect(fs.existsSync(after.thumbPath!)).toBe(true)
+  })
+
+  test('영상이 아닌 파일이면 서버 경로가 없는 안내를 보이고, 도구의 원문은 진행 기록에만 남긴다', async () => {
+    const j = job('queued_probe')
+    const stderr = '[mov,mp4] moov atom not found /Users/someone/data/jobs/abc/source.mp4: Invalid data found'
+    await runOnce(jobs, fakes({ probeVideo: async () => { throw new ToolError('ffprobe', 1, stderr) } }).deps)
+    const after = jobs.get(j.id)!
+    expect(after).toMatchObject({ status: 'failed', failedPhase: 'probe' })
+    expect(after.errorMessage).toContain('읽을 수 없어요')
+    expect(after.errorMessage).not.toContain('/Users/')
+    expect(after.errorMessage).not.toContain('moov')
+    expect(after.log.some((l) => l.message.includes('moov atom not found'))).toBe(true)
+  })
+
+  test('다른 도구(ffmpeg 등)의 실패도 원문(경로 포함)을 화면용 메시지에 싣지 않는다', async () => {
+    const j = job('queued_produce')
+    writeAnalysis(j.id)
+    fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+    await runOnce(jobs, fakes({ produceEdit: async () => { throw new ToolError('ffmpeg', 1, 'Error opening /Users/someone/data/x.mp4: No such file') } }).deps)
+    const after = jobs.get(j.id)!
+    expect(after).toMatchObject({ status: 'failed', failedPhase: 'produce' })
+    expect(after.errorMessage).toContain('ffmpeg')
+    expect(after.errorMessage).not.toContain('/Users/')
+    expect(after.log.some((l) => l.message.includes('No such file'))).toBe(true)
+  })
+
+  test('썸네일을 못 만들어도 작업은 실패하지 않는다', async () => {
+    const j = job('queued_probe')
+    await runOnce(jobs, fakes({ makeThumbnail: async () => { throw new Error('ffmpeg 실패') } }).deps)
+    const after = jobs.get(j.id)!
+    expect(after.status).toBe('ready')
+    expect(after.thumbPath).toBeNull()
+  })
+
+  test('10분을 넘는 영상은 올리자마자 failed(probe) 로 알린다', async () => {
+    const j = job('queued_probe')
+    await runOnce(jobs, fakes({ probeVideo: async () => ({ ...INFO, durationSec: 700 }) }).deps)
+    const after = jobs.get(j.id)!
+    expect(after).toMatchObject({ status: 'failed', failedPhase: 'probe' })
+    expect(after.errorMessage).toContain('너무 길어요')
+  })
+})
+
+describe('analysis 단계', () => {
+  test('레퍼런스가 없으면 추천을 검색해 awaiting_reference 로 보내고 analysis.json 을 남긴다', async () => {
+    const j = job('queued_analysis', { description: '골프 레슨 영상입니다' })
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    const after = jobs.get(j.id)!
+    expect(after.status).toBe('awaiting_reference')
+    expect(after.summary).toMatchObject({ topic: '롱아이언', searchQueries: ['q1', 'q2', 'q3'] })
+    expect(after.recommendations).toEqual([REC])
+    expect(after.purposeGuess).toMatchObject({ purpose: 'short', confidence: 0.8 })
+    expect(JSON.parse(fs.readFileSync(path.join(jobs.jobDir(j.id), 'analysis.json'), 'utf8')).version).toBe(1)
+    expect(f.calls.analyze[0]).toMatchObject({ videoPath: j.sourcePath, workDir: jobs.jobDir(j.id), description: '골프 레슨 영상입니다' })
+    expect(f.calls.analyze[0]!.reference).toBeUndefined() // 레퍼런스는 분석에서 받지 않는다
+    expect(f.calls.search[0]).toEqual({ queries: ['골프 레슨'], purpose: 'short' }) // 세부 검색어(q1~q3)가 아니라 장르로 넓게
+  })
+
+  test('사용자가 고른 용도로 검색한다 (자동 인식과 달라도)', async () => {
+    job('queued_analysis', { purposeChoice: 'post' })
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    expect(f.calls.search[0]!.purpose).toBe('post')
+  })
+
+  test('레퍼런스가 이미 있어도 말이 있으면 자막 확인을 위해 awaiting_reference 에서 멈춘다(추천은 검색하지 않는다)', async () => {
+    const j = job('queued_analysis', { referenceSource: 'https://youtu.be/abc' })
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    const after = jobs.get(j.id)!
+    expect(after.status).toBe('awaiting_reference')
+    expect(after.referenceSource).toBe('https://youtu.be/abc')
+    expect(after.recommendations).toEqual([])
+    expect(f.calls.search).toHaveLength(0)
+  })
+
+  test('말이 없는 영상도 레퍼런스가 있으면 awaiting_reference 에서 멈춘다 — 자막을 직접 넣을 수 있게', async () => {
+    const j = job('queued_analysis', { referenceSource: 'https://youtu.be/abc' })
+    const f = fakes({ analyzeInput: async () => ({ ...ANALYSIS, transcript: { ...ANALYSIS.transcript, hasSpeech: false } }) })
+    await runOnce(jobs, f.deps)
+    expect(jobs.get(j.id)!.status).toBe('awaiting_reference')
+    expect(f.calls.search).toHaveLength(0)
+  })
+
+  test('(Review Focus 1) 분석을 다시 하면 예전 인식 결과에 대한 자막 편집은 비운다', async () => {
+    const j = job('queued_analysis', { transcriptEdits: [{ i: 0, text: '예전 글' }] })
+    await runOnce(jobs, fakes().deps)
+    expect(jobs.get(j.id)!.transcriptEdits).toBeNull()
+  })
+
+  test('(Review Focus 4) 검색이 실패해도 작업은 awaiting_reference 로 가고 경고만 남긴다', async () => {
+    const j = job('queued_analysis')
+    await runOnce(jobs, fakes({ searchReferences: async () => { throw new Error('인터넷 없음') } }).deps)
+    const after = jobs.get(j.id)!
+    expect(after.status).toBe('awaiting_reference')
+    expect(after.recommendations).toEqual([])
+    expect(after.log.some((l) => l.stage === 'search' && /추천/.test(l.message))).toBe(true)
+  })
+
+  test('단계 진행은 stage 와 로그에 한국어로 남는다', async () => {
+    const j = job('queued_analysis')
+    await runOnce(jobs, fakes().deps)
+    const after = jobs.get(j.id)!
+    expect(after.log.some((l) => l.stage === 'transcribe' && l.message.includes('음성 인식'))).toBe(true)
+    expect(after.stage).toBeNull() // 끝나면 비운다
+  })
+})
+
+const W = (text: string, start: number, end: number, confidence = 0.3) => ({ text, start, end, confidence })
+const SPEECH: Analysis = { ...ANALYSIS, transcript: { language: 'ko', durationSec: 56.8, hasSpeech: true, words: [W('이렇게', 0, 0.5), W('되면서', 0.5, 1), W('이게', 4, 4.5), W('섀도우', 4.5, 5)], segments: [] } }
+const writeSpeech = (id: string) => fs.writeFileSync(path.join(jobs.jobDir(id), 'analysis.json'), JSON.stringify(SPEECH))
+
+describe('자막 편집 적용 (plan·produce)', () => {
+  const EDITS = [{ i: 0, text: '이렇게 돼서' }, { i: 1, text: '이게 스윙' }]
+
+  test('plan: prepareEdit 에 고친 글자의 transcript 를 넘기고, analysis.json 은 원본 그대로다', async () => {
+    const j = job('queued_plan', { transcriptEdits: EDITS })
+    writeSpeech(j.id)
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    expect(f.calls.prepare[0]!.analysis.transcript.words.map((x) => x.text)).toEqual(['이렇게', '돼서', '이게', '스윙'])
+    expect(f.calls.prepare[0]!.analysis.transcript.words.every((x) => x.confidence === 1)).toBe(true)
+    const onDisk = JSON.parse(fs.readFileSync(path.join(jobs.jobDir(j.id), 'analysis.json'), 'utf8'))
+    expect(onDisk.transcript.words.map((x: { text: string }) => x.text)).toEqual(['이렇게', '되면서', '이게', '섀도우'])
+  })
+
+  test('produce: produceEdit 에도 같은 고친 transcript 를 넘긴다', async () => {
+    const j = job('queued_produce', { transcriptEdits: EDITS })
+    writeSpeech(j.id)
+    fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    expect(f.calls.produce[0]!.analysis.transcript.words.map((x) => x.text)).toEqual(['이렇게', '돼서', '이게', '스윙'])
+    // 컷은 고치기 전 인식 결과로 계산한다(자막을 고치거나 지워도 영상은 그대로)
+    expect(f.calls.produce[0]!.cutTranscript!.words.map((x) => x.text)).toEqual(['이렇게', '되면서', '이게', '섀도우'])
+  })
+
+  test('편집이 없으면 인식 결과를 그대로 넘긴다', async () => {
+    const j = job('queued_plan')
+    writeSpeech(j.id)
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    expect(f.calls.prepare[0]!.analysis.transcript.words.map((x) => x.text)).toEqual(['이렇게', '되면서', '이게', '섀도우'])
+  })
+
+  test('(I1) plan: 지운 줄의 시간 구간을 prepareEdit 에 알린다(편집 감독이 그 구간을 덜어내지 않게)', async () => {
+    const j = job('queued_plan', { transcriptEdits: [{ i: 1, text: null }, { i: 0, text: '이렇게 돼서' }] })
+    writeSpeech(j.id)
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    expect(f.calls.prepare[0]!.deletedSpans).toEqual([{ start: 4, end: 5 }])
+  })
+
+  test('(Review Focus 2) 모든 줄을 지워도 던지지 않고 계획까지 간다(말 없는 영상으로 이어진다)', async () => {
+    const j = job('queued_plan', { transcriptEdits: [{ i: 0, text: null }, { i: 1, text: '   ' }] })
+    writeSpeech(j.id)
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    expect(jobs.get(j.id)!.status).toBe('awaiting_plan')
+    expect(f.calls.prepare[0]!.analysis.transcript).toMatchObject({ words: [], hasSpeech: false })
+  })
+})
+
+describe('자막 트랙 적용 (plan·produce)', () => {
+  // SPEECH 의 인식: 0~1초 "이렇게 되면서"(줄 0), 4~5초 "이게 섀도우"(줄 1)
+  const L = (start: number, end: number, text: string) => ({ start, end, text })
+  const TRACK = [L(0, 1, '이렇게 돼서'), L(4, 5, '이게 섀도우'), L(10, 12, '새로 넣은 줄')] // 줄 0 고침, 줄 1 그대로, 인식이 놓친 10~12초에 새 줄
+
+  test('plan: 트랙을 입힌 transcript 를 prepareEdit 에 넘기고 analysis.json 은 그대로다', async () => {
+    const j = job('queued_plan', { captionTrack: TRACK })
+    writeSpeech(j.id)
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    const words = f.calls.prepare[0]!.analysis.transcript.words
+    expect(words.map((x) => x.text)).toEqual(['이렇게', '돼서', '이게', '섀도우', '새로', '넣은', '줄'])
+    expect(words.slice(2, 4).map((x) => x.confidence)).toEqual([0.3, 0.3]) // 그대로 둔 줄은 원래 단어·신뢰도
+    expect(words.filter((x) => x.start >= 10 - 1e-6).every((x) => x.confidence === 1)).toBe(true)
+    const onDisk = JSON.parse(fs.readFileSync(path.join(jobs.jobDir(j.id), 'analysis.json'), 'utf8'))
+    expect(onDisk.transcript.words.map((x: { text: string }) => x.text)).toEqual(['이렇게', '되면서', '이게', '섀도우'])
+  })
+
+  test('produce: 같은 transcript 를 주고, cutTranscript 에는 원래 단어 + 인식이 놓친 곳에 넣은 줄 구간이 들어 컷이 잘라내지 않는다 (Review Focus 2)', async () => {
+    const j = job('queued_produce', { captionTrack: TRACK })
+    writeSpeech(j.id)
+    fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    const input = f.calls.produce[0]!
+    expect(input.analysis.transcript.words.map((x) => x.text)).toEqual(['이렇게', '돼서', '이게', '섀도우', '새로', '넣은', '줄'])
+    const cut = input.cutTranscript!.words
+    expect(cut.slice(0, 4).map((x) => x.text)).toEqual(['이렇게', '되면서', '이게', '섀도우']) // 고치기 전 단어 그대로
+    expect(cut.at(-1)).toMatchObject({ start: 10, end: 12 }) // 새 줄 구간은 지켜진다
+  })
+
+  test('plan: 트랙에서 빠진 원래 줄의 구간을 deletedSpans 로 감독에게 알린다', async () => {
+    const j = job('queued_plan', { captionTrack: [L(0, 1, '이렇게 되면서')] })
+    writeSpeech(j.id)
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    expect(f.calls.prepare[0]!.deletedSpans).toEqual([{ start: 4, end: 5 }])
+  })
+
+  test('(Review Focus 3) 트랙이 있으면 예전 줄 번호 편집은 쓰이지 않는다 — 둘 다 있어도 트랙만', async () => {
+    const j = job('queued_plan', { captionTrack: [L(4, 5, '이게 섀도우')], transcriptEdits: [{ i: 0, text: '예전 편집' }] })
+    writeSpeech(j.id)
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    expect(f.calls.prepare[0]!.analysis.transcript.words.map((x) => x.text)).toEqual(['이게', '섀도우'])
+  })
+
+  test('(Review Focus 2) 빈 트랙(자막 전부 지움)도 던지지 않고 계획·제작까지 가고, 컷은 원래 인식 기준이다', async () => {
+    const j = job('queued_plan', { captionTrack: [] })
+    writeSpeech(j.id)
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    expect(jobs.get(j.id)!.status).toBe('awaiting_plan')
+    expect(f.calls.prepare[0]!.analysis.transcript).toMatchObject({ words: [], hasSpeech: false })
+    expect(f.calls.prepare[0]!.deletedSpans).toEqual([{ start: 0, end: 1 }, { start: 4, end: 5 }])
+
+    const k = job('queued_produce', { captionTrack: [] })
+    writeSpeech(k.id)
+    fs.writeFileSync(path.join(jobs.jobDir(k.id), 'prepared.json'), JSON.stringify(PREPARED))
+    await runOnce(jobs, f.deps)
+    expect(f.calls.produce[0]!.cutTranscript!.words.map((x) => x.text)).toEqual(['이렇게', '되면서', '이게', '섀도우'])
+  })
+
+  describe('말이 없는 영상에 사용자가 자막을 넣은 경우', () => {
+    const QUIET: Analysis = { ...ANALYSIS, transcript: { language: 'ko', durationSec: 56.8, hasSpeech: false, words: [], segments: [] } }
+    const writeQuiet = (id: string) => fs.writeFileSync(path.join(jobs.jobDir(id), 'analysis.json'), JSON.stringify(QUIET))
+    const TRACK_Q = [L(5, 8, '여기서 공을 보세요')]
+
+    test('plan: 넣은 줄이 단어가 된 transcript 를 감독에게 넘긴다', async () => {
+      const j = job('queued_plan', { captionTrack: TRACK_Q })
+      writeQuiet(j.id)
+      const f = fakes()
+      await runOnce(jobs, f.deps)
+      const t = f.calls.prepare[0]!.analysis.transcript
+      expect(t.hasSpeech).toBe(true)
+      expect(t.words.map((x) => x.text)).toEqual(['여기서', '공을', '보세요'])
+    })
+
+    test('produce: 자막은 입히되 컷 계산용 transcript 는 말 없음 그대로다(컷이 줄 밖을 자르지 않는다)', async () => {
+      const j = job('queued_produce', { captionTrack: TRACK_Q })
+      writeQuiet(j.id)
+      fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+      const f = fakes()
+      await runOnce(jobs, f.deps)
+      const input = f.calls.produce[0]!
+      expect(input.analysis.transcript.words.map((x) => x.text)).toEqual(['여기서', '공을', '보세요'])
+      expect(input.cutTranscript).toMatchObject({ words: [], hasSpeech: false })
+    })
+  })
+
+  test('(Review Focus 1) 분석을 다시 하면 예전 인식 줄에 맞춘 트랙도 비운다', async () => {
+    const j = job('queued_analysis', { captionTrack: [L(0, 1, '가')], transcriptEdits: [{ i: 0, text: '나' }] })
+    await runOnce(jobs, fakes().deps)
+    expect(jobs.get(j.id)).toMatchObject({ captionTrack: null, transcriptEdits: null })
+  })
+})
+
+describe('plan 단계', () => {
+  test('분석 결과와 입력으로 prepareEdit 를 부르고 계획 카드를 저장해 awaiting_plan 으로 보낸다', async () => {
+    const j = job('queued_plan', { requestText: '컷을 더 빠르게', purposeChoice: 'short', referenceSource: 'https://youtu.be/abc' })
+    writeAnalysis(j.id)
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    const after = jobs.get(j.id)!
+    expect(after).toMatchObject({ status: 'awaiting_plan', purpose: 'short', planCard: ['이렇게 이해했어요: …'] })
+    expect(after.plan).toEqual(PREPARED.plan)
+    expect(after.captionPosition).toBe('top') // 계획이 정한 자막 위치가 승인 화면의 기본값으로 저장된다
+    expect(after.script).toEqual(PREPARED.script) // 편집 감독의 대본도 저장돼 승인 화면이 보여 준다
+    expect(after.scriptEdits).toBeNull() // 계획을 다시 만들면 이전 문구 수정값은 지운다
+    expect(fs.existsSync(path.join(jobs.jobDir(j.id), 'prepared.json'))).toBe(true)
+    expect(f.calls.prepare[0]).toMatchObject({ request: '컷을 더 빠르게', purposeChoice: 'short', reference: 'https://youtu.be/abc' })
+    expect(f.calls.prepare[0]!.analysis.summary.topic).toBe('롱아이언')
+  })
+
+  test('같은 레퍼런스로 다시 계획하면 이전에 분석한 스펙을 넘겨 다시 받지 않는다', async () => {
+    const j = job('queued_plan', { referenceSource: 'https://youtu.be/abc' })
+    writeAnalysis(j.id)
+    fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    expect(f.calls.prepare[0]!.knownSpec).toEqual(SPEC)
+  })
+
+  test('레퍼런스가 바뀌었으면 이전 스펙을 쓰지 않는다', async () => {
+    const j = job('queued_plan', { referenceSource: 'https://youtu.be/다른것' })
+    writeAnalysis(j.id)
+    fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    expect(f.calls.prepare[0]!.knownSpec).toBeUndefined()
+  })
+
+  test('레퍼런스를 못 받으면(비공개) failed(plan) 와 한국어 안내', async () => {
+    const j = job('queued_plan', { referenceSource: 'https://www.instagram.com/reel/x/' })
+    writeAnalysis(j.id)
+    await runOnce(jobs, fakes({ prepareEdit: async () => { throw new ReferenceFetchError('private', '비공개이거나 로그인이 필요한 영상이에요.') } }).deps)
+    const after = jobs.get(j.id)!
+    expect(after).toMatchObject({ status: 'failed', failedPhase: 'plan' })
+    expect(after.errorMessage).toContain('비공개')
+  })
+})
+
+describe('produce 단계 — 소리만 다시 섞기(remixPending)', () => {
+  /** 결과가 나와 있고 사용자가 소리 크기를 바꿔 다시 섞기를 요청한 작업 */
+  function remixJob(patch: Parameters<Jobs['update']>[1] = {}) {
+    const j = job('queued_produce', { remixPending: true, soundGain: { bgmGainDb: 3, sfxGainDb: -2 }, bgmId: 'calm-1', ...patch })
+    const out = path.join(jobs.jobDir(j.id), 'out')
+    fs.mkdirSync(out, { recursive: true })
+    fs.writeFileSync(path.join(out, 'result.mp4'), 'OLD')
+    const old = { qa: { passed: true, findings: [] }, unchecked: ['싱크'], sound: { sfxCount: 2, balance: { bgmGainDb: 0, sfxGainDb: 0, aiBgmGainDb: -1, aiSfxGainDb: 1, reason: '말이 많아요' } } }
+    fs.writeFileSync(path.join(out, 'report.json'), JSON.stringify(old))
+    return jobs.update(j.id, { resultPath: path.join(out, 'result.mp4'), report: old, attempts: 2 })
+  }
+
+  test('영상을 다시 만들지 않고 remixSound 만 부른다 — 분석·계획 파일을 읽지 않고, 결과 경로·썸네일은 그대로', async () => {
+    const j = remixJob() // analysis.json·prepared.json 이 없어도 된다
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    expect(f.calls.produce).toHaveLength(0)
+    expect(f.calls.remix).toEqual([{ outDir: path.join(jobs.jobDir(j.id), 'out'), gains: { bgmGainDb: 3, sfxGainDb: -2 } }])
+    const after = jobs.get(j.id)!
+    expect(after).toMatchObject({ status: 'awaiting_confirm', remixPending: false, errorMessage: null, attempts: 2, resultPath: j.resultPath })
+  })
+  test('리포트의 sound.balance 가 새 값으로 바뀌고 검수 결과 등 나머지는 그대로다 (DB 와 out/report.json 모두)', async () => {
+    const j = remixJob()
+    await runOnce(jobs, fakes({ remixSound: async (i) => ({ sfxCount: 2, balance: { ...i.gains, aiBgmGainDb: -1, aiSfxGainDb: 1, reason: '말이 많아요' } }) }).deps)
+    const expectSound = { sfxCount: 2, balance: { bgmGainDb: 3, sfxGainDb: -2, aiBgmGainDb: -1, aiSfxGainDb: 1, reason: '말이 많아요' } }
+    const db = jobs.get(j.id)!.report as { qa: unknown; unchecked: string[]; sound: unknown }
+    expect(db.sound).toEqual(expectSound)
+    expect(db.qa).toEqual({ passed: true, findings: [] })
+    expect(db.unchecked).toEqual(['싱크'])
+    const file = JSON.parse(fs.readFileSync(path.join(jobs.jobDir(j.id), 'out', 'report.json'), 'utf8'))
+    expect(file.sound).toEqual(expectSound)
+    expect(file.unchecked).toEqual(['싱크'])
+  })
+  test('진행 기록에 "다시 섞는 중" 단계가 남는다', async () => {
+    const j = remixJob()
+    await runOnce(jobs, fakes({ remixSound: async (i) => ({ sfxCount: 0, balance: { ...i.gains, aiBgmGainDb: 0, aiSfxGainDb: 0, reason: '' } }) }).deps)
+    expect(jobs.get(j.id)!.log.some((l) => l.message.includes('다시 섞'))).toBe(true)
+  })
+  test('실패하면(SoundError) 결과 확인 화면으로 돌아오고 기존 결과는 그대로, 안내 문구가 남으며 표시는 꺼진다', async () => {
+    const j = remixJob()
+    const f = fakes({ remixSound: async () => { throw new SoundError('배경음악·효과음을 입히지 못했어요.') } })
+    await runOnce(jobs, f.deps)
+    const after = jobs.get(j.id)!
+    expect(after).toMatchObject({ status: 'awaiting_confirm', remixPending: false, resultPath: j.resultPath, failedPhase: null })
+    expect(after.errorMessage).toContain('입히지 못했어요')
+    expect(after.errorMessage).toContain('기존 결과')
+    expect(fs.readFileSync(j.resultPath!, 'utf8')).toBe('OLD')
+    expect((after.report as { sound: { balance: { bgmGainDb: number } } }).sound.balance.bgmGainDb).toBe(0) // 리포트는 안 바뀐다
+  })
+  test('섞기 도구(ffmpeg)의 원문은 화면 문구에 싣지 않고 진행 기록에만 남긴다', async () => {
+    const j = remixJob()
+    const stderr = 'Error opening input file /Users/someone/assets/sound/bgm/x.mp3: No such file or directory'
+    await runOnce(jobs, fakes({ remixSound: async () => { throw new SoundError('배경음악·효과음을 입히지 못했어요.', stderr) } }).deps)
+    const after = jobs.get(j.id)!
+    expect(after.errorMessage).toContain('입히지 못했어요')
+    expect(after.errorMessage).not.toContain('/Users/')
+    expect(after.errorMessage).not.toContain('No such file')
+    expect(after.log.some((l) => l.message.includes('No such file or directory'))).toBe(true)
+  })
+  test('예상하지 못한 오류도 결과 화면으로 돌아오고, 도구 원문은 진행 기록에만 남는다', async () => {
+    const j = remixJob()
+    await runOnce(jobs, fakes({ remixSound: async () => { throw new Error('EACCES /Users/someone/secret') } }).deps)
+    const after = jobs.get(j.id)!
+    expect(after.status).toBe('awaiting_confirm')
+    expect(after.errorMessage).not.toContain('/Users/')
+    expect(after.log.some((l) => l.message.includes('EACCES'))).toBe(true)
+  })
+  test('다음에 성공하면 이전 오류 문구가 지워진다', async () => {
+    const j = remixJob({ errorMessage: '이전 실패' })
+    await runOnce(jobs, fakes().deps)
+    expect(jobs.get(j.id)!.errorMessage).toBeNull()
+  })
+  test('실행 중 프로그램이 죽어 failed(produce)가 된 작업은 다시 시도하면 remix 경로로 간다 (표시가 남아 있다)', async () => {
+    const j = remixJob()
+    jobs.update(j.id, { status: 'failed', failedPhase: 'produce', errorMessage: '중단' })
+    jobs.transition(j.id, ['failed'], 'queued_produce', { errorMessage: null, failedPhase: null })
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    expect(f.calls.remix).toHaveLength(1)
+    expect(f.calls.produce).toHaveLength(0)
+  })
+  test('직접 조절한 크기(soundGain)가 있는 작업을 새로 만들면 그 값을 엔진에 넘긴다 — 자막을 고쳐 다시 계획해도 조절이 사라지지 않게', async () => {
+    const j = job('queued_produce', { soundGain: { bgmGainDb: 3, sfxGainDb: -2 } })
+    writeAnalysis(j.id)
+    fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    expect(f.calls.produce[0]!.soundGain).toEqual({ bgmGainDb: 3, sfxGainDb: -2 })
+  })
+  test('다시 섞기가 끝나도 적용한 크기(soundGain)는 남는다 — 실패해도 사용자가 원한 값으로 남는다', async () => {
+    const ok = remixJob()
+    await runOnce(jobs, fakes().deps)
+    expect(jobs.get(ok.id)!.soundGain).toEqual({ bgmGainDb: 3, sfxGainDb: -2 })
+    const bad = remixJob()
+    await runOnce(jobs, fakes({ remixSound: async () => { throw new SoundError('배경음악·효과음을 입히지 못했어요.') } }).deps)
+    expect(jobs.get(bad.id)).toMatchObject({ status: 'awaiting_confirm', remixPending: false, soundGain: { bgmGainDb: 3, sfxGainDb: -2 } })
+  })
+  test('소리는 다시 섞였는데 out/report.json 을 못 고쳐도(깨진 파일) 실패라고 하지 않는다 — 결과 화면에는 새 값이 보이고, 못 고친 것만 진행 기록에 남는다', async () => {
+    const j = remixJob()
+    fs.writeFileSync(path.join(jobs.jobDir(j.id), 'out', 'report.json'), '{깨진 파일')
+    await runOnce(jobs, fakes({ remixSound: async (i) => ({ sfxCount: 2, balance: { ...i.gains, aiBgmGainDb: -1, aiSfxGainDb: 1, reason: '말이 많아요' } }) }).deps)
+    const after = jobs.get(j.id)!
+    expect(after).toMatchObject({ status: 'awaiting_confirm', errorMessage: null, remixPending: false })
+    expect((after.report as { sound: { balance: { bgmGainDb: number } } }).sound.balance.bgmGainDb).toBe(3)
+    expect(after.log.some((l) => l.message.includes('report.json'))).toBe(true)
+  })
+  test('remixPending 이 꺼져 있으면 예전처럼 영상을 만든다', async () => {
+    const j = job('queued_produce', { soundGain: { bgmGainDb: 3, sfxGainDb: -2 } })
+    writeAnalysis(j.id)
+    fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    expect(f.calls.produce).toHaveLength(1)
+    expect(f.calls.remix).toHaveLength(0)
+  })
+})
+
+describe('produce 단계', () => {
+  test('결과·리포트·썸네일을 저장하고 awaiting_confirm 으로 보낸다 (화질·자막 설정을 전달)', async () => {
+    const j = job('queued_produce', { quality: 'delivery', captionsMode: 'off' })
+    writeAnalysis(j.id)
+    fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    const after = jobs.get(j.id)!
+    expect(after.status).toBe('awaiting_confirm')
+    expect(after.resultPath).toBe(path.join(jobs.jobDir(j.id), 'out', 'result.mp4'))
+    expect(after.report).toMatchObject({ qa: { passed: true } })
+    expect(after.attempts).toBe(2)
+    expect(fs.existsSync(after.thumbPath!)).toBe(true)
+    expect(f.calls.produce[0]).toMatchObject({ quality: 'delivery', captions: 'off', outDir: path.join(jobs.jobDir(j.id), 'out'), remixFiles: true }) // 다시 섞기에 필요한 파일을 남기게 한다
+    expect(f.calls.produce[0]!.soundGain).toBeUndefined() // 조절한 적 없으면 AI 추천을 쓴다
+    expect(after.log.some((l) => l.message.includes('렌더링'))).toBe(true)
+  })
+
+  test('계획을 다시 만들면 이전 문구 수정값(scriptEdits)을 지운다', async () => {
+    const j = job('queued_plan', { scriptEdits: { title: '예전에 고친 제목' } })
+    writeAnalysis(j.id)
+    await runOnce(jobs, fakes().deps)
+    expect(jobs.get(j.id)!.scriptEdits).toBeNull()
+  })
+
+  test('제작은 사용자가 고친 문구를 계획 대본 위에 덮어서 엔진에 넘긴다', async () => {
+    const j = job('queued_produce', { script: PREPARED.script, scriptEdits: { title: '내가 고친 제목', hookQuestion: '내 질문?', openingLines: [] } })
+    writeAnalysis(j.id)
+    fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    const s = f.calls.produce[0]!.script!
+    expect(s.title).toBe('내가 고친 제목')
+    expect(s.hook?.question).toBe('내 질문?')
+    expect(s.openingLines).toEqual([])
+    expect(s.speed).toBe(1.1) // 고치지 않은 값은 그대로
+  })
+
+  test('수정값이 없으면 prepared.json 의 대본을 그대로(엔진은 prepared.script 를 쓴다), 대본이 없으면 넘기지 않는다', async () => {
+    const a = job('queued_produce')
+    writeAnalysis(a.id)
+    fs.writeFileSync(path.join(jobs.jobDir(a.id), 'prepared.json'), JSON.stringify(PREPARED))
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    expect(f.calls.produce[0]!.script).toBeUndefined() // job.scriptEdits 가 없으면 넘기지 않고 prepared.script 에 맡긴다
+    const b = job('queued_produce', { scriptEdits: { title: 'x' } })
+    writeAnalysis(b.id)
+    fs.writeFileSync(path.join(jobs.jobDir(b.id), 'prepared.json'), JSON.stringify({ ...PREPARED, script: undefined }))
+    const g = fakes()
+    await runOnce(jobs, g.deps)
+    expect(g.calls.produce[0]!.script).toBeUndefined() // 대본이 없는 작업에는 수정값이 있어도 넘기지 않는다
+  })
+
+  test('승인 화면에서 고른 자막 위치(captionPosition)를 엔진에 넘긴다 — 고르지 않았으면 넘기지 않는다', async () => {
+    for (const [captionPosition, expected] of [['middle', 'middle'], [null, undefined]] as const) {
+      const j = job('queued_produce', { captionPosition })
+      writeAnalysis(j.id)
+      fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+      const f = fakes()
+      await runOnce(jobs, f.deps)
+      expect(f.calls.produce[0]!.captionPosition).toBe(expected)
+    }
+  })
+
+  test('소리 설정(audioMode)을 엔진에 넘긴다 — 기본은 original', async () => {
+    for (const audioMode of ['voice', 'original'] as const) {
+      const j = job('queued_produce', { audioMode })
+      writeAnalysis(j.id)
+      fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+      const f = fakes()
+      await runOnce(jobs, f.deps)
+      expect(f.calls.produce[0]).toMatchObject({ audio: audioMode })
+    }
+  })
+
+  test('배경음악·효과음 선택(bgmId·sfxMode)을 엔진에 넘긴다 — 기본은 없음·끄기', async () => {
+    for (const [patch, expected] of [
+      [{ bgmId: 'calm-1', sfxMode: 'on' as const }, { bgm: 'calm-1', sfx: 'on' }],
+      [{}, { bgm: null, sfx: 'off' }],
+    ] as const) {
+      const j = job('queued_produce', patch)
+      writeAnalysis(j.id)
+      fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+      const f = fakes()
+      await runOnce(jobs, f.deps)
+      expect(f.calls.produce[0]).toMatchObject(expected)
+    }
+  })
+
+  test('음원 오류(SoundError)는 한국어 안내를 그대로 보여 주고 failed(produce) 로 둔다', async () => {
+    const j = job('queued_produce', { bgmId: 'gone' })
+    writeAnalysis(j.id)
+    fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+    await runOnce(jobs, fakes({ produceEdit: async () => { throw new SoundError('음원 파일이 없어요: gone (bgm/gone.mp3)') } }).deps)
+    const after = jobs.get(j.id)!
+    expect(after).toMatchObject({ status: 'failed', failedPhase: 'produce', errorMessage: '음원 파일이 없어요: gone (bgm/gone.mp3)' })
+  })
+
+  test('속도 조정 오류(TempoError)도 한국어 안내를 그대로 보여 주고 failed(produce) 로 둔다', async () => {
+    const j = job('queued_produce')
+    writeAnalysis(j.id)
+    fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+    await runOnce(jobs, fakes({ produceEdit: async () => { throw new TempoError('속도를 맞추지 못했어요: ffmpeg 가 실패했어요') } }).deps)
+    expect(jobs.get(j.id)).toMatchObject({ status: 'failed', failedPhase: 'produce', errorMessage: '속도를 맞추지 못했어요: ffmpeg 가 실패했어요' })
+  })
+
+  test('목소리 보정 도구가 없어서 실패하면 설치 안내를 그대로 보여 주고 failed(produce) 로 둔다', async () => {
+    const j = job('queued_produce', { audioMode: 'voice' })
+    writeAnalysis(j.id)
+    fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+    await runOnce(jobs, fakes({ produceEdit: async () => { throw new VoiceError(VOICE_TOOL_MISSING) } }).deps)
+    const after = jobs.get(j.id)!
+    expect(after).toMatchObject({ status: 'failed', failedPhase: 'produce' })
+    expect(after.errorMessage).toBe(VOICE_TOOL_MISSING)
+  })
+
+  test('결과 영상을 직접 재서 길이·크기를 리포트에 남긴다 (목록의 길이 표시용)', async () => {
+    const j = job('queued_produce')
+    writeAnalysis(j.id)
+    fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+    const probeVideo = async (p: string) => (p.endsWith('result.mp4') ? { ...INFO, durationSec: 44.2, width: 1080, height: 1920 } : INFO)
+    await runOnce(jobs, fakes({ probeVideo }).deps)
+    expect(jobs.get(j.id)!.report).toMatchObject({ qa: { passed: true }, output: { durationSec: 44.2, width: 1080, height: 1920 } })
+  })
+
+  test('결과를 재지 못해도 작업은 실패하지 않고 리포트는 그대로다', async () => {
+    const j = job('queued_produce')
+    writeAnalysis(j.id)
+    fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+    await runOnce(jobs, fakes({ probeVideo: async () => { throw new Error('ffprobe 실패') } }).deps)
+    const after = jobs.get(j.id)!
+    expect(after.status).toBe('awaiting_confirm')
+    expect(after.report).toMatchObject({ qa: { passed: true } })
+    expect(after.report).not.toHaveProperty('output')
+  })
+})
+
+describe('실패 처리와 순서', () => {
+  test('예상하지 못한 오류는 일반 안내 + 로그에 상세, failedPhase 를 남긴다', async () => {
+    const j = job('queued_analysis')
+    await runOnce(jobs, fakes({ analyzeInput: async () => { throw new TypeError('undefined is not a function') } }).deps)
+    const after = jobs.get(j.id)!
+    expect(after).toMatchObject({ status: 'failed', failedPhase: 'analysis' })
+    expect(after.errorMessage).toContain('예상하지 못한 오류')
+    expect(after.log.some((l) => l.message.includes('undefined is not a function'))).toBe(true)
+  })
+
+  test('실패한 작업은 실패한 단계의 대기 상태로 다시 보낼 수 있다', async () => {
+    const j = job('queued_produce')
+    writeAnalysis(j.id)
+    fs.writeFileSync(path.join(jobs.jobDir(j.id), 'prepared.json'), JSON.stringify(PREPARED))
+    await runOnce(jobs, fakes({ produceEdit: async () => { throw new Error('렌더 실패') } }).deps)
+    expect(jobs.get(j.id)!.failedPhase).toBe('produce')
+    expect(jobs.transition(j.id, ['failed'], 'queued_produce', { errorMessage: null })).not.toBeNull()
+    await runOnce(jobs, fakes().deps)
+    expect(jobs.get(j.id)!.status).toBe('awaiting_confirm')
+  })
+
+  test('대기 작업이 없으면 idle, 둘이면 오래된 것부터 하나씩', async () => {
+    expect(await runOnce(jobs, fakes().deps)).toBe('idle')
+    const a = job('queued_probe')
+    const b = job('queued_probe')
+    const f = fakes()
+    await runOnce(jobs, f.deps)
+    expect(jobs.get(a.id)!.status).toBe('ready')
+    expect(jobs.get(b.id)!.status).toBe('queued_probe')
+    await runOnce(jobs, f.deps)
+    expect(jobs.get(b.id)!.status).toBe('ready')
+  })
+})
+
+describe('startWorker', () => {
+  const waitFor = async (cond: () => boolean, ms = 4000) => {
+    const t0 = Date.now()
+    while (!cond()) {
+      if (Date.now() - t0 > ms) throw new Error('시간 초과')
+      await new Promise((r) => setTimeout(r, 15))
+    }
+  }
+
+  test('(Review Focus 3) 시작할 때 실행 중이던 작업을 failed(중단)로 바꾸고, 이어서 대기 작업을 처리한다', async () => {
+    const stuck = job('producing')
+    const next = job('queued_probe')
+    const w = startWorker({ dataDir: dir, pollMs: 20, deps: fakes().deps })
+    await waitFor(() => jobs.get(next.id)!.status === 'ready')
+    await w.stop()
+    const after = jobs.get(stuck.id)!
+    expect(after).toMatchObject({ status: 'failed', failedPhase: 'produce' })
+    expect(after.errorMessage).toMatch(/멈췄어요/)
+  })
+
+  test('stop 은 진행 중이던 한 건을 끝낸 뒤 반환하고 그 뒤에는 더 집지 않는다', async () => {
+    const a = job('queued_probe')
+    let release!: () => void
+    const gate = new Promise<void>((r) => (release = r))
+    const f = fakes({
+      probeVideo: async () => {
+        await gate
+        return INFO
+      },
+    })
+    const w = startWorker({ dataDir: dir, pollMs: 20, deps: f.deps })
+    await waitFor(() => jobs.get(a.id)!.status === 'probing')
+    const b = job('queued_probe')
+    let stopped = false
+    const stopping = w.stop().then(() => (stopped = true))
+    await new Promise((r) => setTimeout(r, 60))
+    expect(stopped).toBe(false) // 진행 중인 건이 끝나길 기다린다
+    release()
+    await stopping
+    expect(jobs.get(a.id)!.status).toBe('ready')
+    expect(jobs.get(b.id)!.status).toBe('queued_probe')
+  })
+})

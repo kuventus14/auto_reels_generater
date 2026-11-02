@@ -1,0 +1,111 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import type { ZodType } from 'zod'
+import type { Job, Jobs } from '../db/jobs.ts'
+import { UNSUPPORTED_FORMAT_MESSAGE, VIDEO_EXTS, videoExtOf } from '../shared/media.ts'
+import { getContext } from './context.ts'
+
+export function jsonError(status: number, message: string): Response {
+  return Response.json({ error: message }, { status })
+}
+
+export function parseJobId(id: string): string | null {
+  return /^[a-f0-9]{10}$/.test(id) ? id : null
+}
+
+const LOCAL_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '[::1]'])
+
+function hostnameOf(host: string): string {
+  const h = host.toLowerCase()
+  return h.startsWith('[') ? h.slice(0, h.indexOf(']') + 1) : h.split(':')[0]!
+}
+
+/**
+ * 요청의 Host 가 이 컴퓨터(127.0.0.1·localhost·[::1], 포트는 무관)가 아니면 403. 읽기(GET)를 포함해 모든 API 가 쓴다.
+ * 공격 페이지가 자기 도메인을 DNS 로 127.0.0.1 에 돌려(DNS 리바인딩) 같은 출처처럼 요청을 보내면 Origin 과 Host 가 같은 이름이라
+ * Origin 검사만으로는 막지 못한다 — 이 앱은 127.0.0.1 로만 열리므로 그 밖의 이름은 받지 않는다.
+ */
+export function assertLocalHost(req: Request): Response | null {
+  const host = req.headers.get('host') ?? new URL(req.url).host
+  return LOCAL_HOSTNAMES.has(hostnameOf(host)) ? null : jsonError(403, '이 앱은 이 컴퓨터에서만 열 수 있어요')
+}
+
+/**
+ * 변경 요청(POST/PUT/DELETE)은 Host 가 이 컴퓨터여야 하고, Origin 이 있으면 Host 와 같아야 통과한다.
+ * 다른 사이트가 내 로컬 앱에 요청을 보내 영상을 지우거나 내려받게 하는 것을 막는다. Origin 이 없는 호출(curl)은 허용.
+ */
+export function assertSameOrigin(req: Request): Response | null {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return null
+  const wrongHost = assertLocalHost(req)
+  if (wrongHost) return wrongHost
+  const origin = req.headers.get('origin')
+  if (!origin) return null
+  let originHost: string
+  try {
+    originHost = new URL(origin).host
+  } catch {
+    return jsonError(403, '허용되지 않은 요청이에요')
+  }
+  const host = req.headers.get('host') ?? new URL(req.url).host
+  return originHost === host ? null : jsonError(403, '다른 사이트에서 보낸 요청은 받을 수 없어요')
+}
+
+/** 올릴 수 있는 영상 확장자(없으면 null). 사용자가 보낸 파일 이름은 디스크 경로에 쓰지 않고 이 확장자만 쓴다. */
+export function allowedExt(name: string | null): string | null {
+  return videoExtOf(name)
+}
+
+export { UNSUPPORTED_FORMAT_MESSAGE, VIDEO_EXTS }
+
+/** 경로의 작업 id 를 검사해 작업을 읽는다. 잘못된 id 는 400, 없으면 404 응답을 돌려준다. */
+export async function loadJob(params: Promise<{ id: string }>): Promise<{ job: Job; jobs: Jobs } | { res: Response }> {
+  const { id } = await params
+  if (!parseJobId(id)) return { res: jsonError(400, '잘못된 작업 주소예요') }
+  const { jobs } = getContext()
+  const job = jobs.get(id)
+  return job ? { job, jobs } : { res: jsonError(404, '작업을 찾을 수 없어요') }
+}
+
+/** JSON 본문을 읽어 zod 로 검증한다. 본문이 비어 있으면 {} 로 본다(모든 항목이 선택인 요청용). 잘못되면 400 응답. */
+export async function readBody<T>(req: Request, schema: ZodType<T>): Promise<{ data: T } | { res: Response }> {
+  const text = await req.text()
+  let json: unknown = {}
+  if (text.trim()) {
+    try {
+      json = JSON.parse(text)
+    } catch {
+      return { res: jsonError(400, '요청 내용을 읽을 수 없어요') }
+    }
+  }
+  const parsed = schema.safeParse(json)
+  return parsed.success ? { data: parsed.data } : { res: jsonError(400, '요청 내용이 올바르지 않아요') }
+}
+
+export class EmptyUploadError extends Error {}
+
+/**
+ * 요청 본문을 파일로 스트리밍해 저장한다(통째로 메모리에 올리지 않는다).
+ * 임시 이름(.part)으로 쓰다가 끝나면 이름을 바꾸고, 도중에 끊기거나 비어 있으면 임시 파일을 지운다.
+ */
+export async function saveUpload(body: ReadableStream<Uint8Array>, dir: string, finalName: string): Promise<{ path: string; bytes: number }> {
+  const tmp = path.join(dir, `${finalName}.part`)
+  const finalPath = path.join(dir, finalName)
+  try {
+    await pipeline(Readable.fromWeb(body as never), fs.createWriteStream(tmp))
+    const bytes = fs.statSync(tmp).size
+    if (bytes === 0) throw new EmptyUploadError('빈 파일이에요')
+    fs.renameSync(tmp, finalPath)
+    return { path: finalPath, bytes }
+  } catch (e) {
+    fs.rmSync(tmp, { force: true })
+    throw e
+  }
+}
+
+/** saveUpload 의 실패를 사용자에게 보여 줄 응답으로 바꾼다. */
+export function uploadFailure(e: unknown): Response {
+  if (e instanceof EmptyUploadError) return jsonError(400, '빈 파일이에요. 영상을 다시 골라 주세요.')
+  return jsonError(400, '업로드가 중간에 끊겼어요. 다시 올려 주세요.')
+}
